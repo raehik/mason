@@ -35,6 +35,8 @@ module Mason.Builder
   , shortByteString
   -- * Text
   , textUtf8
+  , textUtf8Fast
+  , textUtf8Fast2
   , encodeUtf8Builder
   , encodeUtf8BuilderEscaped
   , char7
@@ -126,6 +128,10 @@ import Data.Foldable (toList)
 import Data.Word
 import Data.Int
 import qualified Data.Text as T
+import qualified Data.Text.Internal as T
+import qualified Data.Text.Encoding as T
+import qualified Data.Text.Array as TA
+import Control.Monad.ST.Unsafe (unsafeSTToIO)
 import Foreign.C.Types
 import Foreign.Ptr (Ptr, plusPtr, castPtr)
 import Foreign.Storable
@@ -302,6 +308,57 @@ encodeUtf8Builder x = textUtf8 x
 textUtf8 :: T.Text -> Builder
 textUtf8 x = B.encodeUtf8BuilderEscaped (P.liftFixedToBounded P.word8) x
 {-# INLINE textUtf8 #-}
+
+-- | Encode 'T.Text' as a UTF-8 byte stream fast.
+--
+-- TODO text-2.0 only
+textUtf8Fast :: T.Text -> Builder
+textUtf8Fast = byteString . T.encodeUtf8
+{-# INLINE textUtf8Fast #-}
+
+textUtf8Fast2 :: Buildable s => T.Text -> BuilderFor s
+textUtf8Fast2 (T.Text arr off len) = withPtr len $ \ptr -> do
+    unsafeSTToIO $ TA.copyToPointer arr off ptr len
+    return $ ptr `plusPtr` len
+{-# INLINE textUtf8Fast2 #-}
+
+{-
+byteStringCopy= \(B.PS fsrc ofs len) -> withPtr len $ \ptr -> do
+  unsafeWithForeignPtr fsrc $ \src -> B.memcpy ptr (src `plusPtr` ofs) len
+  return $ ptr `plusPtr` len
+
+-- | Encode text using UTF-8 encoding.
+encodeUtf8 :: T.Text -> B.ByteString
+encodeUtf8 (Text arr off len)
+  | len == 0  = B.empty
+  -- It would be easier to use Data.ByteString.Short.fromShort and slice later,
+  -- but this is undesirable when len is significantly smaller than length arr.
+  | otherwise = unsafeDupablePerformIO $ do
+    marr@(A.MutableByteArray mba) <- unsafeSTToIO $ A.newPinned len
+    unsafeSTToIO $ A.copyI len marr 0 arr off
+    let fp = ForeignPtr (byteArrayContents# (unsafeCoerce# mba))
+                        (PlainPtr mba)
+    pure $ B.fromForeignPtr fp 0 len
+
+-- | Encode text to a ByteString 'B.Builder' using UTF-8 encoding.
+--
+-- @since 1.1.0.0
+encodeUtf8Builder :: Text -> B.Builder
+encodeUtf8Builder =
+    -- manual eta-expansion to ensure inlining works as expected
+    \txt -> B.builder (step txt)
+  where
+    step txt@(Text arr off len) !k br@(B.BufferRange op ope)
+      -- Ensure that the common case is not recursive and therefore yields
+      -- better code.
+      | op' <= ope = do
+          unsafeSTToIO $ A.copyToPointer arr off op len
+          k (B.BufferRange op' ope)
+      | otherwise = textCopyStep txt k br
+      where
+        op' = op `plusPtr` len
+{-# INLINE encodeUtf8Builder #-}
+-}
 
 --------------------
 -- Unsigned integers
